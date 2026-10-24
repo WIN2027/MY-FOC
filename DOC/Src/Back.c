@@ -2,93 +2,75 @@
 #include "cmsis_os2.h"
 #include "main.h"
 #include "FreeRTOS_Task.h"
-#include "FOC.h"
 #include "UART.h"
 #include "ADC.h"
+#include "AppFOC.h"
+#include "FOC_CORE.h"
 #include "Init.h"
 
-// ReSharper disable once CppParameterMayBeConstPtrOrRef
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM20){HAL_IncTick();}
+    if (htim->Instance == TIM20)
+    {
+        HAL_IncTick();
+    }
     if (htim->Instance == TIM4)
     {
-        if (g_telemetry_enable) {osThreadFlagsSet(Telemetry_TaskHandle, 0x01);}
+        if (g_telemetry_enable)
+        {
+            (void)osThreadFlagsSet(Telemetry_TaskHandle, 0x01U);
+        }
     }
 }
+
 void HAL_HRTIM_Fault1Callback(HRTIM_HandleTypeDef *hhrtim)
 {
+    (void)hhrtim;
     __HAL_HRTIM_CLEAR_FLAG(&hhrtim1, HRTIM_FLAG_FLT1);
 
-    if (foc_state != FOC_STATE_IDLE)
+    const FOC_State_t state = FOC_GetState();
+    if (state != FOC_STATE_IDLE && state != FOC_STATE_FAULT)
     {
-        foc_state = FOC_STATE_IDLE;
+        App_FOC_AlignOnly = false;
+        FOC_OnFault(APP_FAULT_HRTIM);
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-
-        UART_SendResponse(CMD_Fault1, NULL, 0);
-
-        HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
-        // // 2. 一次性同步停止主定时器 + A + B + D (HAL 宏支持掩码)
-        __HAL_HRTIM_DISABLE(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
-
     }
 }
+
 void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef *hhrtim, uint32_t TimerIdx)
 {
-    speed_pid.sample_frequency++;
-    if (foc_state == FOC_STATE_CLOSEDLOOP && speed_pid.sample_frequency >= 25)
+    (void)hhrtim;
+    (void)TimerIdx;
+    FOC_SpeedLoopTick();
+}
+
+__attribute__((section(".ccmram_text"))) void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1)
     {
-        speed_pid.sample_frequency = 0;SpeedLoop_Update();
-        if (smo.omega_est > 5.0f || smo.omega_est < -5.0f) {float dummy;Cordic_Phase(smo.lp_freq, smo.omega_est, CORDIC_FREQ_SCALE, &dummy, &smo.theta_comp);}
+        ADC1_Ready = true;
+    }
+    if (hadc->Instance == ADC2)
+    {
+        ADC2_Ready = true;
     }
 
-}
-// void HAL_HRTIM_Fault3Callback(HRTIM_HandleTypeDef *hhrtim)
-// {
-//     HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
-//     HAL_HRTIM_WaveformCountStop(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
-//     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-//     UART_SendResponse(CMD_Fault1, NULL, 0);
-// }
-__attribute__((section(".ccmram_text")))void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-    if (hadc->Instance == ADC1){ADC1_Ready = true;}
-    if (hadc->Instance == ADC2){ADC2_Ready = true;}
-    if (ADC1_Ready == true && ADC2_Ready == true)
+    if (ADC1_Ready && ADC2_Ready)
     {
-        const uint32_t start_cycle = DWT->CYCCNT;
-
         ADC1_Ready = false;
         ADC2_Ready = false;
+
         const float IU = ADC1_Filter(ADC1_DMA_BUF);
         const float IV = ADC2_Filter(ADC2_DMA_BUF);
 
-        FOC_Run(IU,IV);
+        FOC_Run(IU, IV);
 
-        const uint32_t end_cycle = DWT->CYCCNT;
-        s_telemetry.foc_dwt = end_cycle - start_cycle;
-
+        /* 0x09 仅对齐：FOC 核心在 ALIGN 计时结束后会自动切到 OPENLOOP，
+         * 这里在同一拍立即停机，避免执行强拖。 */
+        if (App_FOC_AlignOnly && FOC_GetState() == FOC_STATE_OPENLOOP)
+        {
+            App_FOC_Stop();
+            App_FOC_AlignDone = true;
+        }
     }
 }
-
-
-
-
-// #include "main.h"
-// #include "cmsis_os.h"
-// #include "Init.h"
-// #include "FreeRTOS_Task.h"
-//
-//
-// int main(void)
-// {
-//
-//     Peripheral_Init();
-//     osKernelInitialize();
-//     FreeRTOS_TaskInit();
-//     osKernelStart();
-//
-//     // ReSharper disable once CppDFAEndlessLoop
-//     while (1){}
-//
-// }

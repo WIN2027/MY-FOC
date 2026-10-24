@@ -1,298 +1,432 @@
 #include "UART.h"
-#include <stdio.h>
-#include "FOC.h"
-#include "Init.h"
+
 #include <string.h>
-#include "cmsis_os2.h"
+
+#include "main.h"
+#include "Init.h"
 #include "DRV8320S.h"
-#include "FreeRTOS_Task.h"
-#include "stm32g4xx_hal.h"
+#include "FOC_CORE.h"
+#include "ADC.h"
+#include "AppFOC.h"
+#include "Protocol.h"
+#include "Protocol_HAL.h"
 
-// ---------- DEBUG模式 ----------
+/* 对外协议布局的编译期校验 */
+_Static_assert(sizeof(CurrentPIDConfig_t) == 16U, "CurrentPIDConfig_t must be 16 bytes");
+_Static_assert(sizeof(SpeedPIDConfig_t) == 12U, "SpeedPIDConfig_t must be 12 bytes");
+_Static_assert(sizeof(DRV8320S_Config_t) == 18U, "DRV8320S_Config_t must be 18 bytes");
+_Static_assert(sizeof(DRV8320S_InitTypeDef) == 14U, "DRV8320S_InitTypeDef must be 14 bytes");
+_Static_assert(sizeof(StartupConfigWire_t) == 20U, "StartupConfigWire_t must be 20 bytes");
+_Static_assert(sizeof(MotorParamsWire_t) == 17U, "MotorParamsWire_t must be 17 bytes");
+
+/* =========================================================
+ *  对外状态
+ * ========================================================= */
 bool FOC_Debug = false;
+volatile uint16_t g_telemetry_mask = 0xFFFF;
+volatile bool g_telemetry_enable = false;
 
-// ---------- 接收状态机变量 ----------
-static uint8_t Rx_Index = 0;
-static bool Frame_Ready = false;
+/* 协议实例必须是普通 SRAM（含 DMA 收发缓冲，不能放 CCM） */
+static Protocol_Context_t     g_proto;
+static Protocol_HAL_Context_t g_hal;
 
-// 遥测使能掩码，默认为全部使能（0xFFFF）
-uint16_t g_telemetry_mask = 0xFFFF;
-bool g_telemetry_enable = false;   // 主动上报使能标志
+static uint32_t s_reported_fault = FOC_FAULT_NONE;
 
-// ---------- DMA 接收缓冲区（单次模式） ----------
-uint8_t DMA_Rx_Buf[DMA_RX_BUF_SIZE];
-uint16_t Rx_Len = 0;
-
-// ---------- 发送 DMA 控制 ----------
-uint8_t DMA_Tx_Buf[DMA_TX_BUF_SIZE];
-volatile bool Tx_Busy = false;
-
-// ---------- CRC8校验 ----------
-static uint8_t crc8(const uint8_t *data, const uint8_t len) {
-    uint8_t crc = 0xFF;
-    for (uint8_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (uint8_t bit = 0; bit < 8; bit++) {
-            if (crc & 0x80) crc = (crc << 1) ^ 0x07;
-            else crc <<= 1;
-        }
-    }
-    return crc;
+/* =========================================================
+ *  小工具
+ * ========================================================= */
+static uint16_t clamp_u16(float v)
+{
+    if (!(v > 0.0f))      return 0U;
+    if (v >= 65535.0f)    return 65535U;
+    return (uint16_t)(v + 0.5f);
 }
 
-// ---------- 串口队列发送 ----------
-void UART_SendResponse(uint8_t cmd, const uint8_t *data, uint8_t len)
+static int16_t clamp_i16(float v)
 {
-    if (UART_Tx_Queue == NULL) return;
+    if (!(v == v))      return 0;       /* NaN 防护，避免浮点转整型 UB */
+    if (v > 32767.0f)   return 32767;
+    if (v < -32768.0f)  return -32768;
+    return (int16_t)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
+}
 
-    // 限制数据长度
-    if (len > UART_TX_MSG_MAX_SIZE - 4) {len = UART_TX_MSG_MAX_SIZE - 4;}
+static uint16_t append_u16(uint8_t *buf, uint16_t n, uint16_t cap, uint16_t v)
+{
+    if ((uint32_t)n + 2U > cap) return n;
+    buf[n++] = (uint8_t)(v & 0xFFU);
+    buf[n++] = (uint8_t)((v >> 8) & 0xFFU);
+    return n;
+}
 
-    UART_TxMsg_t msg;
-    msg.data[0] = 0x5A;                     // SOF
-    msg.data[1] = cmd;                      // CMD
-    msg.data[2] = len;                      // LEN
-    if (len && data) {
-        memcpy(&msg.data[3], data, len);
-    }
-    // 计算CRC（从CMD开始）
-    msg.data[3 + len] = crc8(&msg.data[1], 2 + len);
-    msg.len = 4 + len;                      // 总长度
+static uint16_t append_i16(uint8_t *buf, uint16_t n, uint16_t cap, int16_t v)
+{
+    return append_u16(buf, n, cap, (uint16_t)v);
+}
 
-    // 入队（超时0，若队列满则丢弃）
-    if (osMessageQueuePut(UART_Tx_Queue, &msg, 0U, 0U) == osOK)
+/* =========================================================
+ *  遥测打包
+ * ========================================================= */
+static uint16_t UART_PackTelemetry(uint8_t *buf, uint16_t cap)
+{
+    FOC_Telemetry_t tele;
+    uint16_t n = 0U;
+    const uint16_t mask = g_telemetry_mask;
+
+    FOC_GetTelemetry(&tele);
+
+    if (mask & 0x0001U) n = append_u16(buf, n, cap, clamp_u16(ADC1_Prev * 16.0f));
+    if (mask & 0x0002U) n = append_u16(buf, n, cap, clamp_u16(ADC2_Prev * 16.0f));
+    if (mask & 0x0004U) n = append_i16(buf, n, cap, tele.IU);
+    if (mask & 0x0008U) n = append_i16(buf, n, cap, tele.IV);
+    if (mask & 0x0010U) n = append_i16(buf, n, cap, tele.IW);
+    if (mask & 0x0020U) n = append_i16(buf, n, cap, clamp_i16(pi_d.actual * 100.0f));
+    if (mask & 0x0040U) n = append_i16(buf, n, cap, clamp_i16(pi_q.actual * 100.0f));
+    if (mask & 0x0080U) n = append_i16(buf, n, cap, smo.speed_rpm);
+    if (mask & 0x0100U) n = append_u16(buf, n, cap, tele.foc_dwt);
+
+    if (mask & 0x0200U)
     {
-        // 设置发送队列标志，唤醒 UART_Task
-        osThreadFlagsSet(UART_TaskHandle, BIT_TX_QUEUE);
+        n = append_u16(buf, n, cap, PWM.PWM_U);
+        n = append_u16(buf, n, cap, PWM.PWM_V);
+        n = append_u16(buf, n, cap, PWM.PWM_W);
     }
-    // 若队列满，消息丢失（可在此增加错误计数）
-}
 
-// ---------- 用户回调 ----------
-static CmdHandlerEntry_t CMD_Table[MAX_CMD_HANDLERS] = {0};  // 全部初始化为0
-
-/**
- * @brief 处理从 DMA 接收缓冲区中提取的一帧数据
- * @param buf   指向完整帧数据的指针（应包含 SOF、CMD、LEN、DATA、CRC）
- * @param len   接收到的数据总长度（字节数）
- * @retval 无
- * @note  该函数执行以下步骤：
- *        1. 检查最小帧长度（至少 4 字节：SOF+CMD+LEN+CRC）
- *        2. 校验帧头（SOF = 0x5A）
- *        3. 根据 LEN 字段计算预期帧长度，并与实际长度比对
- *        4. 计算 CRC8（从 CMD 到 DATA 结束）并与接收到的 CRC 对比
- *        5. 查找命令处理表，调用对应的回调函数
- *        6. 若校验失败或命令无效，自动发送错误应答帧
- */
-void SerialCom_ProcessFrame(const uint8_t *buf, const uint16_t len)
-{
-    uint16_t offset = 0; // 增加一个游标，记录当前解析到哪个字节
-
-    // 只要游标还没走到缓冲区末尾，就继续解析
-    while (offset < len)
+    if (mask & 0x0400U)
     {
-        // 1. 寻找帧头 0x5A（防止前面有乱码或半截垃圾数据）
-        while (offset < len && buf[offset] != 0x5A) {
-            offset++;
-        }
-
-        // 如果剩下的数据连最小帧长(4字节)都不够了，说明后面全是残包，直接结束
-        if (len - offset < 4) {
-            break;
-        }
-
-        // 2. 提取协议字段
-        uint8_t cmd = buf[offset + 1];
-        uint8_t data_len = buf[offset + 2];
-        uint16_t expected_len = 4 + data_len; // SOF(1) + CMD(1) + LEN(1) + DATA(N) + CRC(1)
-
-        // 如果剩下的数据不够这一帧的完整长度，说明发生了半包，退出等待下一次接收
-        if (len - offset < expected_len) {
-            break;
-        }
-
-        // 3. 计算并校验 CRC（从 CMD 开始到 DATA 结束）
-        uint8_t calc_crc = crc8(&buf[offset + 1], 2 + data_len);
-        uint8_t recv_crc = buf[offset + 3 + data_len];
-
-        if (calc_crc == recv_crc)
-        {
-            // 4. 查找命令处理函数
-            SerialDataHandler_t handler = NULL;
-            for (int i = 0; i < MAX_CMD_HANDLERS; i++) {
-                if (CMD_Table[i].Enabled && CMD_Table[i].CMD == cmd) {
-                    handler = CMD_Table[i].Handler;
-                    break;
-                }
-            }
-
-            // 5. 执行回调
-            if (handler != NULL) {
-                // 注意这里传的是 buf[offset + 3]，因为前面加了偏移
-                handler(cmd, &buf[offset + 3], data_len);
-            } else {
-                UART_SendResponse(CMD_ERR_INVALID_CMD, NULL, 0);
-            }
-
-            // 6. 成功解析一帧，游标向前移动一整帧的长度，准备解析下一帧
-            offset += expected_len;
-        }
-        else
-        {
-            // CRC 校验失败
-            UART_SendResponse(CMD_ERR_CRC, NULL, 0);
-            // 游标只往前走 1 个字节，跳过这个假帧头，去后面继续寻找真正的 0x5A
-            offset += 1;
-        }
+        n = append_i16(buf, n, cap, clamp_i16(pi_d.out * 100.0f));
+        n = append_i16(buf, n, cap, clamp_i16(pi_d.error * 100.0f));
+        n = append_i16(buf, n, cap, clamp_i16(pi_d.integral * 100.0f));
+        n = append_i16(buf, n, cap, clamp_i16(pi_d.actual * 100.0f));
     }
-}
-/**
- * @brief UART DMA 发送完成回调（由 HAL 库自动调用）
- * @param huart 触发回调的 UART 句柄
- * @return 无
- * @note  清除 Tx_Busy 标志，允许下一次发送。
- */
-// ReSharper disable once CppParameterMayBeConstPtrOrRef
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART3) {Tx_Busy = false;}
-}
-/**
- * @brief UART 空闲中断回调（需在 stm32g4xx_it.c 中调用或直接放于中断函数）
- * @param huart 触发回调的 UART 句柄
- * @return 无
- * @note  当 USART3 产生空闲中断时，此函数被调用。
- *        它计算本次 DMA 接收到的字节数（Rx_Len），然后唤醒 UART_Task 处理数据。
- *        此实现假设 DMA 工作在 Normal 模式（收到一帧后自动停止）。
- */
-// ReSharper disable once CppParameterMayBeConstPtrOrRef
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
-{
-    if (huart->Instance == USART3)
+
+    if (mask & 0x0800U)
     {
-        // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);   // LED 闪烁指示进入回调
-        if (Size !=0 && Size!=DMA_RX_BUF_SIZE) {Rx_Len = Size; Frame_Ready = true;osThreadFlagsSet(UART_TaskHandle, BIT_RX_READY);;}
-    }
-}
-/**
- * @brief 注册一个命令码及其处理函数（精确映射）
- * @param cmd     命令码（如 CMD_SET_SPEED）
- * @param handler 处理该命令的回调函数指针
- * @retval 无
- * @note  如果同一个命令码被重复注册，后注册的会覆盖先注册的。
- *        最多支持 MAX_CMD_HANDLERS 个映射条目。
- */
-void SerialCom_RegisterCmdHandler(const uint8_t cmd, SerialDataHandler_t handler)
-{
-    if (handler == NULL) return;
-
-    // 先检查是否已经注册过同样的命令码（避免重复）
-    for (int i = 0; i < MAX_CMD_HANDLERS; i++)
-        {
-        if (CMD_Table[i].Enabled && CMD_Table[i].CMD == cmd)
-        {
-            // 可选：更新回调函数（覆盖旧值）
-            CMD_Table[i].Handler = handler;return;
-        }
-    }
-    // 找一个空闲槽位
-    for (int i = 0; i < MAX_CMD_HANDLERS; i++) {
-        if (!CMD_Table[i].Enabled) {
-            CMD_Table[i].CMD = cmd;
-            CMD_Table[i].Handler = handler;
-            CMD_Table[i].Enabled = 1;
-            return;
-        }
+        n = append_i16(buf, n, cap, clamp_i16(pi_q.out * 100.0f));
+        n = append_i16(buf, n, cap, clamp_i16(pi_q.error * 100.0f));
+        n = append_i16(buf, n, cap, clamp_i16(pi_q.integral * 100.0f));
+        n = append_i16(buf, n, cap, clamp_i16(pi_q.actual * 100.0f));
     }
 
-    // 如果执行到这里，说明表已满，可触发错误处理（例如设置全局错误标志）
-    // 对于嵌入式系统，也可选择覆盖最旧的条目（这里简单忽略并返回）
+    if (mask & 0x1000U)
+    {
+        n = append_i16(buf, n, cap, clamp_i16(smo.v_est * 100.0f));
+    }
+
+    return n;
 }
-/**
- * @brief 注销一个命令码的处理函数
- * @param cmd 要注销的命令码
- * @retval 无
- * @note  注销后该命令将无法被识别，底层会回复 CMD_ERR_INVALID_CMD
- */
-void SerialCom_UnregisterCmdHandler(const uint8_t cmd)
+
+void UART_SendTelemetryReport(void)
 {
-    for (int i = 0; i < MAX_CMD_HANDLERS; i++) {
-        if (CMD_Table[i].Enabled && CMD_Table[i].CMD == cmd) {
-            CMD_Table[i].Enabled = 0;
-            // 可选：清除 handler 和 cmd
-            CMD_Table[i].Handler = NULL;
-            CMD_Table[i].CMD = 0;
-            break;
-        }
+    uint8_t buf[PROTOCOL_MAX_PAYLOAD];
+    const uint16_t n = UART_PackTelemetry(buf, (uint16_t)sizeof(buf));
+
+    (void)UART_SendResponse(CMD_TELEMETRY_REPORT, buf, (uint8_t)n);
+}
+
+bool UART_SendResponse(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    return Protocol_Send(&g_proto, cmd, data, len);
+}
+
+/* =========================================================
+ *  故障码 -> 错误命令码
+ * ========================================================= */
+static uint8_t foc_err_to_cmd(FOC_Err_t err)
+{
+    switch (err)
+    {
+        case FOC_ERR_NOT_CONFIGURED:      return CMD_ERR_NOT_CONFIGURED;
+        case FOC_ERR_PARAM_OUT_OF_RANGE:  return CMD_ERR_PARAM;
+        case FOC_ERR_BUSY:                return CMD_ERR_BUSY;
+        case FOC_ERR_HW_SELFTEST:         return CMD_ERR_HW;
+        case FOC_ERR_INVALID_STATE:
+        default:                          return CMD_ERR_STATE;
     }
 }
 
-// ---------- 命令回调 ----------
-void Slave_ACK(const uint8_t cmd, const uint8_t *data, uint8_t len)
+/* =========================================================
+ *  故障异步上报（0x88 + 4 字节故障码，小端）
+ * ========================================================= */
+static void UART_ReportFault(void)
 {
-    (void)data;(void)len;
+    const uint32_t fault = FOC_GetLastFault();
 
-    // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
-    // HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
+    if (fault == FOC_FAULT_NONE)
+    {
+        s_reported_fault = FOC_FAULT_NONE;
+        return;
+    }
+    if (fault == s_reported_fault)
+    {
+        return;
+    }
 
-    // 使用通用应答函数发送空数据域（仅表示命令已成功接收）
-    UART_SendResponse(cmd, NULL, 0);
+    const uint8_t payload[4] = {
+        (uint8_t)(fault & 0xFFU),
+        (uint8_t)((fault >> 8) & 0xFFU),
+        (uint8_t)((fault >> 16) & 0xFFU),
+        (uint8_t)((fault >> 24) & 0xFFU),
+    };
+
+    /* 发送环满时保持未上报状态，下个周期重试 */
+    if (UART_SendResponse(CMD_Fault1, payload, (uint8_t)sizeof(payload)))
+    {
+        s_reported_fault = fault;
+    }
+}
+
+/* =========================================================
+ *  命令回调
+ * ========================================================= */
+static void Get_Version_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    static const char version[] = "FOC-G474 v1.8";
+    (void)data;
+    (void)len;
+    (void)UART_SendResponse(cmd, (const uint8_t *)version, (uint8_t)(sizeof(version) - 1U));
 }
 
 static void Start_Align_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
 {
-    (void)cmd; (void)data; (void)len;
-    FOC_Start(FOC_STATE_ALIGN);
+    (void)cmd;
+    (void)data;
+    (void)len;
 
-    HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
+    if (!ADC_SelfTest_OK)
+    {
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
+        return;
+    }
 
-    // 1. 启动前清零计数器 (推荐使用 HAL 宏)
-    __HAL_HRTIM_SETCOUNTER(&hhrtim1, HRTIM_TIMERINDEX_TIMER_A, 0);
-    __HAL_HRTIM_SETCOUNTER(&hhrtim1, HRTIM_TIMERINDEX_TIMER_B, 0);
-    __HAL_HRTIM_SETCOUNTER(&hhrtim1, HRTIM_TIMERINDEX_TIMER_D, 0);
+    /* 功率级上电默认关闭；启动前显式使能 DRV8320S 并等待 tWAKE */
+    if (HAL_DRV8320S_Enable(&hdrv8320s, 1) != HAL_OK)
+    {
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
+        return;
+    }
+    HAL_Delay(1);
 
-    // 2. 一次性同步启动主定时器 + A + B + D (HAL 宏支持掩码)
-    __HAL_HRTIM_ENABLE(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
-
-    if (g_telemetry_enable){HAL_TIM_Base_Start_IT(&htim4);}
-
-    UART_SendResponse(CMD_ACK_OK, NULL, 0);
+    const FOC_Err_t err = App_FOC_Start(true);
+    (void)UART_SendResponse(err == FOC_OK ? CMD_ACK_OK : foc_err_to_cmd(err), NULL, 0U);
 }
 
 static void START_MOTOR_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
 {
-    (void)cmd; (void)data; (void)len;
+    (void)cmd;
+    (void)data;
+    (void)len;
 
-    FOC_Start(FOC_STATE_OPENLOOP);
+    if (!ADC_SelfTest_OK)
+    {
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
+        return;
+    }
 
-    speed_pid.target = 1500.0f;
+    /* 功率级上电默认关闭；启动前显式使能 DRV8320S 并等待 tWAKE */
+    if (HAL_DRV8320S_Enable(&hdrv8320s, 1) != HAL_OK)
+    {
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
+        return;
+    }
+    HAL_Delay(1);
 
-    HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
-
-    // 1. 启动前清零计数器 (推荐使用 HAL 宏)
-    __HAL_HRTIM_SETCOUNTER(&hhrtim1, HRTIM_TIMERINDEX_TIMER_A, 0);
-    __HAL_HRTIM_SETCOUNTER(&hhrtim1, HRTIM_TIMERINDEX_TIMER_B, 0);
-    __HAL_HRTIM_SETCOUNTER(&hhrtim1, HRTIM_TIMERINDEX_TIMER_D, 0);
-
-    // 2. 一次性同步启动主定时器 + A + B + D (HAL 宏支持掩码)
-    __HAL_HRTIM_ENABLE(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
-
-    if (g_telemetry_enable){HAL_TIM_Base_Start_IT(&htim4);}
-
-    UART_SendResponse(CMD_ACK_OK, NULL, 0);
+    const FOC_Err_t err = App_FOC_Start(false);
+    (void)UART_SendResponse(err == FOC_OK ? CMD_ACK_OK : foc_err_to_cmd(err), NULL, 0U);
 }
 
 static void STOP_MOTOR_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
 {
-    (void)cmd; (void)data; (void)len;
-    HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
-    // // 2. 一次性同步停止主定时器 + A + B + D (HAL 宏支持掩码)
-    __HAL_HRTIM_DISABLE(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
+    (void)cmd;
+    (void)data;
+    (void)len;
 
-    FOC_Stop();
+    App_FOC_Stop();
+    (void)UART_SendResponse(CMD_ACK_OK, NULL, 0U);
+}
 
-    HAL_TIM_Base_Stop_IT(&htim4);
+static void SetSpeed_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)cmd;
 
+    if (len != 2U)
+    {
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
+        return;
+    }
+
+    const int16_t rpm = (int16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
+    FOC_SetSpeedTarget(rpm);
+    (void)UART_SendResponse(CMD_ACK_OK, NULL, 0U);
+}
+
+static void Set_Startup_Config_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)cmd;
+
+    if (len != sizeof(StartupConfigWire_t))
+    {
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
+        return;
+    }
+
+    StartupConfigWire_t wire;
+    memcpy(&wire, data, sizeof(wire));
+
+    const FOC_StartupConfig_t cfg = {
+        .align_current_a    = wire.align_current_a,
+        .align_time_ms      = wire.align_time_ms,
+        .openloop_current_a = wire.openloop_current_a,
+        .openloop_time_ms   = wire.openloop_time_ms,
+        .openloop_freq_hz   = wire.openloop_freq_hz,
+    };
+
+    const FOC_Err_t err = FOC_SetStartupConfig(&cfg);
+    (void)UART_SendResponse(err == FOC_OK ? CMD_ACK_OK : foc_err_to_cmd(err), NULL, 0U);
+}
+
+static void Get_Startup_Config_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)data;
+    (void)len;
+
+    FOC_StartupConfig_t cfg;
+    const FOC_Err_t err = FOC_GetStartupConfig(&cfg);
+    if (err != FOC_OK)
+    {
+        (void)UART_SendResponse(foc_err_to_cmd(err), NULL, 0U);
+        return;
+    }
+
+    const StartupConfigWire_t wire = {
+        .align_current_a    = cfg.align_current_a,
+        .align_time_ms      = cfg.align_time_ms,
+        .openloop_current_a = cfg.openloop_current_a,
+        .openloop_time_ms   = cfg.openloop_time_ms,
+        .openloop_freq_hz   = cfg.openloop_freq_hz,
+    };
+
+    (void)UART_SendResponse(cmd, (const uint8_t *)&wire, (uint8_t)sizeof(wire));
+}
+
+static void Set_Motor_Params_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)cmd;
+
+    if (len != sizeof(MotorParamsWire_t))
+    {
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
+        return;
+    }
+
+    MotorParamsWire_t wire;
+    memcpy(&wire, data, sizeof(wire));
+
+    const FOC_MotorConfig_t cfg = {
+        .R          = wire.R,
+        .Ld         = wire.Ld,
+        .Lq         = wire.Lq,
+        .flux_link  = wire.flux_link,
+        .pole_pairs = wire.pole_pairs,
+    };
+
+    const FOC_Err_t err = FOC_SetMotorParams(&cfg);
+    (void)UART_SendResponse(err == FOC_OK ? CMD_ACK_OK : foc_err_to_cmd(err), NULL, 0U);
+}
+
+static void Get_Motor_Params_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)data;
+    (void)len;
+
+    FOC_MotorConfig_t cfg;
+    const FOC_Err_t err = FOC_GetMotorParams(&cfg);
+    if (err != FOC_OK)
+    {
+        (void)UART_SendResponse(foc_err_to_cmd(err), NULL, 0U);
+        return;
+    }
+
+    const MotorParamsWire_t wire = {
+        .R          = cfg.R,
+        .Ld         = cfg.Ld,
+        .Lq         = cfg.Lq,
+        .flux_link  = cfg.flux_link,
+        .pole_pairs = cfg.pole_pairs,
+    };
+
+    (void)UART_SendResponse(cmd, (const uint8_t *)&wire, (uint8_t)sizeof(wire));
+}
+
+static void Set_Current_PI_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    if (len != sizeof(CurrentPIDConfig_t))
+    {
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
+        return;
+    }
+
+    CurrentPIDConfig_t cfg;
+    memcpy(&cfg, data, sizeof(cfg));
+    FOC_SetCurrentPID(cfg.kp_d, cfg.ki_d, cfg.kp_q, cfg.ki_q);
+
+    CurrentPIDConfig_t cur;
+    FOC_GetCurrentPID(&cur.kp_d, &cur.ki_d, &cur.kp_q, &cur.ki_q);
+    (void)UART_SendResponse(cmd, (const uint8_t *)&cur, (uint8_t)sizeof(cur));
+}
+
+static void Set_Speed_PID_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    if (len != sizeof(SpeedPIDConfig_t))
+    {
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
+        return;
+    }
+
+    SpeedPIDConfig_t cfg;
+    memcpy(&cfg, data, sizeof(cfg));
+    FOC_SetSpeedPID(cfg.kp, cfg.ki, cfg.kd);
+
+    SpeedPIDConfig_t cur;
+    FOC_GetSpeedPID(&cur.kp, &cur.ki, &cur.kd);
+    (void)UART_SendResponse(cmd, (const uint8_t *)&cur, (uint8_t)sizeof(cur));
+}
+
+static void SetTelemetryMask_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)cmd;
+
+    if (len != 3U)
+    {
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
+        return;
+    }
+
+    g_telemetry_mask   = (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
+    g_telemetry_enable = (data[2] != 0U);
+    (void)UART_SendResponse(CMD_ACK_OK, NULL, 0U);
+}
+
+static void Set_Debug_Mode(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)cmd;
+
+    if (len < 1U)
+    {
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
+        return;
+    }
+
+    FOC_Debug = (data[0] != 0U);
+    (void)UART_SendResponse(CMD_ACK_OK, NULL, 0U);
+}
+
+static void Request_Telemetry_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
+{
+    (void)cmd;
+    (void)data;
+    (void)len;
+
+    UART_SendTelemetryReport();
 }
 
 /**
@@ -300,188 +434,159 @@ static void STOP_MOTOR_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
  */
 static void Get_DRV8320S_Config(uint8_t cmd, const uint8_t *data, uint8_t len)
 {
-    (void)cmd; (void)data; (void)len; // 避免未使用警告
+    (void)cmd;
+    (void)data;
+    (void)len;
 
     DRV8320S_Config_t config;
-    if (HAL_DRV8320S_GetConfig(&hdrv8320s, &config) == HAL_OK) {
-        // 直接发送结构体（二进制）
-        UART_SendResponse(CMD_GET_DRV_CONFIG, (const uint8_t*)&config, sizeof(config));
-    } else
+    if (HAL_DRV8320S_GetConfig(&hdrv8320s, &config) == HAL_OK)
     {
-        // 读取失败，发送错误
-        UART_SendResponse(CMD_ERR_CRC, NULL, 0);
+        (void)UART_SendResponse(CMD_GET_DRV_CONFIG, (const uint8_t *)&config, (uint8_t)sizeof(config));
+    }
+    else
+    {
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
     }
 }
 
 /**
  * @brief 清除 DRV8320S 故障寄存器（FAULT1/FAULT2）
- * @param cmd   命令码（CMD_CLEAR_FAULTS）
- * @param data  数据域（无数据，此处忽略）
- * @param len   数据长度（应为 0）
  */
 static void Clear_Faults_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
 {
-    (void)cmd; (void)data; (void)len;  // 避免未使用警告
+    (void)cmd;
+    (void)data;
+    (void)len;
 
     HAL_DRV8320S_UnlockRegisters(&hdrv8320s);
 
-    if (HAL_DRV8320S_ClearFaults(&hdrv8320s) == HAL_OK) {UART_SendResponse(CMD_ACK_OK, NULL, 0);}
-    else {UART_SendResponse(CMD_ERR_CRC, NULL, 0);  }// 清除失败返回通用错误
+    if (HAL_DRV8320S_ClearFaults(&hdrv8320s) == HAL_OK)
+    {
+        (void)UART_SendResponse(CMD_ACK_OK, NULL, 0U);
+    }
+    else
+    {
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
+    }
 
     HAL_DRV8320S_LockRegisters(&hdrv8320s);
 }
 
 /**
- * @brief 设置 DRV8320S 配置（从上位机接收配置结构体）
- * @param cmd   命令码（CMD_SET_DRV_CONFIG）
- * @param data  数据域指针，指向 DRV8320S_InitTypeDef 结构体
- * @param len   数据长度（必须等于 sizeof(DRV8320S_InitTypeDef)）
+ * @brief 设置 DRV8320S 配置（仅 IDLE/FAULT 允许）
  */
 static void Set_DRV8320S_Config(uint8_t cmd, const uint8_t *data, uint8_t len)
 {
     (void)cmd;
+
     if (len != sizeof(DRV8320S_InitTypeDef))
     {
-        UART_SendResponse(CMD_ERR_CRC, NULL, 0);  // 长度错误
+        (void)UART_SendResponse(CMD_ERR_PARAM, NULL, 0U);
         return;
     }
-    // 1. 使能器件（拉高 ENABLE）
-    HAL_DRV8320S_Enable(&hdrv8320s, 1);
-    HAL_Delay(4);  // 等待器件稳定（> tWAKE 1ms）
+    if (App_FOC_IsRunning())
+    {
+        (void)UART_SendResponse(CMD_ERR_BUSY, NULL, 0U);
+        return;
+    }
 
-    // 解锁寄存器（允许写入）
+    DRV8320S_InitTypeDef config;
+    memcpy(&config, data, sizeof(config));
+
+    HAL_DRV8320S_Enable(&hdrv8320s, 1);
+    HAL_Delay(4);  /* > tWAKE 1 ms */
+
     if (HAL_DRV8320S_UnlockRegisters(&hdrv8320s) != HAL_OK)
     {
-        UART_SendResponse(CMD_ERR_CRC, NULL, 0);
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
         return;
     }
 
-    // 复制配置结构体（注意：数据从 data 指向的缓冲区直接转换）
-    const DRV8320S_InitTypeDef *config = (const DRV8320S_InitTypeDef*)data;
-
-    // 调用初始化函数（会执行所有写入操作）
-    if (HAL_DRV8320S_Init(&hdrv8320s, config) != HAL_OK) {
-        UART_SendResponse(CMD_ERR_CRC, NULL, 0);
-        // 可选：配置失败后重新锁定寄存器
-        HAL_DRV8320S_LockRegisters(&hdrv8320s);
-        return;
-    }
-    // 可选：锁定寄存器（防止意外修改）
-    HAL_DRV8320S_LockRegisters(&hdrv8320s);
-
-    // 发送成功应答（无数据）
-    UART_SendResponse(CMD_ACK_OK, NULL, 0);
-}
-
-static void Set_Current_PI_Callback(uint8_t cmd, const uint8_t *data, uint8_t len) {
-    (void)cmd;
-    if (len != sizeof(CurrentPIDConfig_t)) {UART_SendResponse(CMD_ERR_CRC, NULL, 0);return;}
-
-    const CurrentPIDConfig_t *cfg = (const CurrentPIDConfig_t *)data;
-    FOC_SetCurrentPID(cfg->kp_d, cfg->ki_d, cfg->kp_q, cfg->ki_q);
-
-    CurrentPIDConfig_t cur_cfg;
-    FOC_GetCurrentPID(&cur_cfg.kp_d, &cur_cfg.ki_d, &cur_cfg.kp_q, &cur_cfg.ki_q);
-    UART_SendResponse(cmd, (const uint8_t*)&cur_cfg, sizeof(CurrentPIDConfig_t));
-}
-
-static void Set_Speed_PID_Callback(uint8_t cmd, const uint8_t *data, uint8_t len) {
-    (void)cmd;
-    if (len != sizeof(SpeedPIDConfig_t)) {UART_SendResponse(CMD_ERR_CRC, NULL, 0);return;}
-
-    const SpeedPIDConfig_t *cfg = (const SpeedPIDConfig_t *)data;
-    FOC_SetSpeedPID(cfg->kp, cfg->ki, cfg->kd);
-
-    SpeedPIDConfig_t cur_cfg;
-    FOC_GetSpeedPID(&cur_cfg.kp, &cur_cfg.ki, &cur_cfg.kd);
-    UART_SendResponse(cmd, (const uint8_t*)&cur_cfg, sizeof(SpeedPIDConfig_t));
-}
-
-static void Set_Debug_Mode(uint8_t cmd, const uint8_t *data, uint8_t len)
-{
-    (void)cmd; // 保留，本函数不依赖 cmd
-
-    // 检查数据有效性：必须非空且长度至少为1
-    if (data == NULL || len < 1) {UART_SendResponse(CMD_ERR_INVALID_CMD, NULL, 0); return;}
-    uint8_t mode = data[0];
-    // 根据数据域设置调试模式
-    if (mode == 0) {FOC_Debug = false;HAL_HRTIM_WaveformCountStop(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);}
-    else if (mode == 1) {FOC_Debug = true;HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);}
-    else {UART_SendResponse(CMD_ERR_INVALID_CMD, NULL, 0);return;}
-    if (g_telemetry_enable){HAL_TIM_Base_Start_IT(&htim4);}
-    // 操作成功，返回确认
-    UART_SendResponse(CMD_ACK_OK, NULL, 0);
-}
-
-/**
- * @brief 设置目标转速命令回调
- * @param cmd   命令码（CMD_SET_SPEED）
- * @param data  数据域指针，2字节小端 int16_t RPM
- * @param len   数据长度（应为2）
- */
-static void SetSpeed_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
-{
-    (void)cmd;
-    if (len != 2)
+    if (HAL_DRV8320S_Init(&hdrv8320s, &config) != HAL_OK)
     {
-        UART_SendResponse(CMD_ERR_CRC, NULL, 0);
+        HAL_DRV8320S_LockRegisters(&hdrv8320s);
+        (void)UART_SendResponse(CMD_ERR_HW, NULL, 0U);
         return;
     }
-    int16_t rpm = (int16_t)(data[0] | (data[1] << 8));
-    FOC_SetSpeedTarget(rpm);   // 使用FOC模块提供的API
-    UART_SendResponse(CMD_ACK_OK, NULL, 0);
-}
 
-/**
- * @brief 设置遥测使能掩码（支持2字节旧格式和3字节新格式）
- * @param cmd   命令码（CMD_SET_TELEMETRY_MASK）
- * @param data  数据域指针
- *               len=3: 掩码低字节在前，第3字节为使能 (0=禁用, 非0=启用)
- * @param len   数据长度（3）
- */
-static void SetTelemetryMask_Callback(uint8_t cmd, const uint8_t *data, uint8_t len)
-{
-    (void)cmd;
-    if (len != 3) {UART_SendResponse(CMD_ERR_CRC, NULL, 0);return;}
-    // 更新掩码（小端模式）
-    g_telemetry_mask = (uint16_t)(data[0] | (data[1] << 8));
-
-    g_telemetry_enable = (data[2] != 0);
-
-    UART_SendResponse(CMD_ACK_OK, NULL, 0);
+    HAL_DRV8320S_LockRegisters(&hdrv8320s);
+    (void)UART_SendResponse(CMD_ACK_OK, NULL, 0U);
 }
 
 static void START_MOTOR_INIT(uint8_t cmd, const uint8_t *data, uint8_t len)
 {
     (void)cmd;
+    (void)data;
+    (void)len;
+    (void)UART_SendResponse(CMD_ACK_OK, NULL, 0U);
 }
 
-/**
- * @brief 初始化串口软件状态机
- * @note  此函数不配置硬件UART，仅重置接收索引、帧标志、DMA头指针。
- *        注意：内部启动了DMA循环接收，可能与空闲中断的单次模式冲突，建议结合实际DMA配置修改。
- */
-void SerialCom_Init(void) {
-    Rx_Index = 0;
-    Frame_Ready = false;
-    SerialCom_RegisterCmdHandler(CMD_GET_VERSION,Slave_ACK);
-    SerialCom_RegisterCmdHandler(CMD_START_ALIGN, Start_Align_Callback);
-    SerialCom_RegisterCmdHandler(CMD_GET_DRV_CONFIG, Get_DRV8320S_Config);
-    SerialCom_RegisterCmdHandler(CMD_SET_DRV_CONFIG, Set_DRV8320S_Config);
-    SerialCom_RegisterCmdHandler(CMD_SET_CURRENT_PI, Set_Current_PI_Callback);
-    SerialCom_RegisterCmdHandler(CMD_SET_SPEED_PID, Set_Speed_PID_Callback);
-    SerialCom_RegisterCmdHandler(CMD_CLEAR_FAULTS, Clear_Faults_Callback);
-    SerialCom_RegisterCmdHandler(CMD_SET_TELEMETRY_MASK, SetTelemetryMask_Callback);
-    SerialCom_RegisterCmdHandler(CMD_DEBUG_MODE, Set_Debug_Mode);
-    SerialCom_RegisterCmdHandler(CMD_START_MOTOR, START_MOTOR_Callback);
-    SerialCom_RegisterCmdHandler(CMD_STOP_MOTOR, STOP_MOTOR_Callback);
-    SerialCom_RegisterCmdHandler(CMD_SET_SPEED, SetSpeed_Callback);
-    SerialCom_RegisterCmdHandler(CMD_START_INIT,START_MOTOR_INIT);
+/* =========================================================
+ *  初始化与周期处理
+ * ========================================================= */
+void SerialCom_Init(void)
+{
+    s_reported_fault = FOC_FAULT_NONE;
 
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart3, DMA_Rx_Buf, DMA_RX_BUF_SIZE);
-    // 必须在每次重启接收后关闭半传输中断：HT事件会把缓冲区前半段误当成完整帧
-    __HAL_DMA_DISABLE_IT(&hdma_usart3_rx, DMA_IT_HT);
+    if (!Protocol_HAL_Init(&g_hal, &g_proto, &huart3))
+    {
+        Error_Handler();
+    }
+
+    (void)Protocol_RegisterHandler(&g_proto, CMD_GET_VERSION,        Get_Version_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_START_ALIGN,        Start_Align_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_GET_DRV_CONFIG,     Get_DRV8320S_Config);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_SET_DRV_CONFIG,     Set_DRV8320S_Config);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_SET_CURRENT_PI,     Set_Current_PI_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_SET_SPEED_PID,      Set_Speed_PID_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_CLEAR_FAULTS,       Clear_Faults_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_SET_TELEMETRY_MASK, SetTelemetryMask_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_DEBUG_MODE,         Set_Debug_Mode);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_START_MOTOR,        START_MOTOR_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_STOP_MOTOR,         STOP_MOTOR_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_SET_SPEED,          SetSpeed_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_SET_STARTUP_CONFIG, Set_Startup_Config_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_GET_STARTUP_CONFIG, Get_Startup_Config_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_SET_MOTOR_PARAMS,   Set_Motor_Params_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_GET_MOTOR_PARAMS,   Get_Motor_Params_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_REQUEST_TELEMETRY,  Request_Telemetry_Callback);
+    (void)Protocol_RegisterHandler(&g_proto, CMD_START_INIT,         START_MOTOR_INIT);
 }
 
+void SerialCom_Process(void)
+{
+    Protocol_HAL_Process();
 
+#if PROTOCOL_DEFER_HANDLER
+    Protocol_Process(&g_proto);
+#endif
 
+    UART_ReportFault();
+
+    /* 0x09 仅对齐完成事件；发送环满时保留标志，下周期重试 */
+    if (App_FOC_AlignDone)
+    {
+        if (UART_SendResponse(CMD_ALIGN_DONE, NULL, 0U))
+        {
+            App_FOC_AlignDone = false;
+        }
+    }
+}
+
+/* =========================================================
+ *  HAL 回调转发
+ * ========================================================= */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    Protocol_HAL_TxCpltCallback(huart);
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    Protocol_HAL_RxEventCallback(huart, Size);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    Protocol_HAL_ErrorCallback(huart);
+}

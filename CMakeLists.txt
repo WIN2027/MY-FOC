@@ -44,10 +44,15 @@ add_executable(${CMAKE_PROJECT_NAME}
         DOC/Src/Init.c
         DOC/Src/FreeRTOS_Task.c
         DOC/Src/Back.c
-        DOC/Src/FOC.c
+        DOC/Src/AppFOC.c
         DOC/Src/UART.c
         DOC/Src/ADC.c
         DOC/Src/DRV8320S.c
+        Modules/FOC_ADC/FOC_ADC.c
+        Modules/FOC_CORE/FOC_CORE.c
+        Modules/FOC_CORE/FOC_PORT_STM32G4.c
+        Modules/UART_Protocol/Protocol.c
+        Modules/UART_Protocol/Protocol_HAL.c
         Middlewares/ST/ARM/DSP/Inc/arm_math.h)
 
 # Add STM32CubeMX generated sources
@@ -67,11 +72,16 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
         DOC/Inc
+        Modules/FOC_ADC
+        Modules/FOC_CORE
+        Modules/UART_Protocol
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined symbols
+    PROTOCOL_DEFER_HANDLER=1
+    FOC_USE_CCM_RAM
+    ADC_FILTER_TEXT_CCM
 )
 
 # Remove wrong libob.a library dependency when using cpp files

@@ -1,66 +1,60 @@
 #include "ADC.h"
-#include <stdlib.h>   // 为 abs() 提供原型
-#include "stm32g4xx_hal.h"
+#define ADC_FILTER_DATA_CCM
+#include "FOC_ADC.h"
 
 /**
  * @file ADC.c
- * @brief 限幅 + 一阶低通 IIR 滤波实现
+ * @brief 应用层 ADC 适配：把 FOC_ADC 可移植模块接到现有工程
+ *
+ * 与旧实现的区别：
+ *   - 滤波/换算由 FOC_ADC 模块完成，ADC1_Filter()/ADC2_Filter() 直接返回安培值；
+ *   - ADC1_Prev/ADC2_Prev 仍保存“滤波后的 ADC 码值”，保持遥测打包代码不变；
+ *   - 模块实例放 CCM，函数仍在 Flash，避免引入 CCM 取指配置。
+ *
+ * 模块来源：模块/FOC_ADC（v1.3，commit 4f93491），FOC_ADC.c/h 内容未修改。
  */
 
+/* ------------------- 对外状态（保持旧工程符号名） ------------------- */
+__attribute__((section(".ccmram_data"))) volatile bool ADC1_Ready = false;
+__attribute__((section(".ccmram_data"))) volatile bool ADC2_Ready = false;
+__attribute__((section(".ccmram_data"))) volatile bool ADC_SelfTest_OK = false;
 
-__attribute__((section(".ccmram_data")))volatile bool ADC1_Ready = false;
-__attribute__((section(".ccmram_data")))volatile bool ADC2_Ready = false;
+__attribute__((section(".ccmram_data"))) float ADC1_Prev = 0.0f;
+__attribute__((section(".ccmram_data"))) float ADC2_Prev = 0.0f;
 
-__attribute__((section(".ccmram_data")))uint16_t ADC1_BUF[3];
-__attribute__((section(".ccmram_data")))uint16_t ADC2_BUF[3];
+/* ------------------- FOC_ADC 模块实例 ------------------- */
+static ADC_FILTER_DATA ADC_Filter_t s_adc1_filter;
+static ADC_FILTER_DATA ADC_Filter_t s_adc2_filter;
 
-__attribute__((section(".ccmram_data")))float ADC1_Prev;
-__attribute__((section(".ccmram_data")))float ADC2_Prev;
-
-
-void ADC_Init()
+void ADC_Init(void)
 {
-    ADC1_BUF[0] = 2048;ADC1_BUF[1] = 2048;ADC1_BUF[2] = 2048;
-    ADC2_BUF[0] = 2048;ADC2_BUF[1] = 2048;ADC2_BUF[2] = 2048;
+    ADC1_Ready = false;
+    ADC2_Ready = false;
+
+    ADC_Filter_Init(&s_adc1_filter, ADC_FILTER_ALPHA, ADC_FILTER_MIDPOINT, ADC_FILTER_CURRENT_SCALE);
+    ADC_Filter_Init(&s_adc2_filter, ADC_FILTER_ALPHA, ADC_FILTER_MIDPOINT, ADC_FILTER_CURRENT_SCALE);
+
+    /* 首拍遥测码值 = 中点，保持与旧 ADC_Init() 的 2048 初值一致 */
+    ADC1_Prev = ADC_Filter_GetFilteredCode(&s_adc1_filter);
+    ADC2_Prev = ADC_Filter_GetFilteredCode(&s_adc2_filter);
+
+#if ADC_FILTER_ENABLE_SELFTEST
+    ADC_SelfTest_OK = ADC_SelfTest();
+#else
+    ADC_SelfTest_OK = true;
+#endif
 }
 
-__attribute__((section(".ccmram_text")))float ADC1_Filter(uint16_t raw)
+float ADC1_Filter(uint16_t raw)
 {
-
-    // 更新历史窗口（循环移位）
-    ADC1_BUF[0] = ADC1_BUF[1];
-    ADC1_BUF[1] = ADC1_BUF[2];
-    ADC1_BUF[2] = raw;
-
-    // ---------- 中值滤波（内联排序，三个数） ----------
-    uint16_t a = ADC1_BUF[0], b = ADC1_BUF[1], c = ADC1_BUF[2];
-    if (a > b) { uint16_t t = a; a = b; b = t; }
-    if (b > c) { uint16_t t = b; b = c; c = t; }
-    if (a > b) { uint16_t t = a; a = b; b = t; }
-    const float median = (float)b;   // 中值
-
-    // ---------- 一阶 IIR 低通 ----------
-    const float new_out = 0.7f * median + 0.3f * ADC1_Prev;
-    ADC1_Prev = new_out;
-    return new_out;
+    const float current = ADC_Filter_Update(&s_adc1_filter, raw);
+    ADC1_Prev = ADC_Filter_GetFilteredCode(&s_adc1_filter);
+    return current;
 }
-__attribute__((section(".ccmram_text")))float ADC2_Filter(uint16_t raw)
+
+float ADC2_Filter(uint16_t raw)
 {
-
-    // 更新历史窗口（循环移位）
-    ADC2_BUF[0] = ADC2_BUF[1];
-    ADC2_BUF[1] = ADC2_BUF[2];
-    ADC2_BUF[2] = raw;
-
-    // ---------- 中值滤波（内联排序，三个数） ----------
-    uint16_t a = ADC2_BUF[0], b = ADC2_BUF[1], c = ADC2_BUF[2];
-    if (a > b) { uint16_t t = a; a = b; b = t; }
-    if (b > c) { uint16_t t = b; b = c; c = t; }
-    if (a > b) { uint16_t t = a; a = b; b = t; }
-    const float median = (float)b;   // 中值
-
-    // ---------- 一阶 IIR 低通 ----------
-    const float new_out = 0.7f * median + 0.3f * ADC2_Prev;
-    ADC2_Prev = new_out;
-    return new_out;
+    const float current = ADC_Filter_Update(&s_adc2_filter, raw);
+    ADC2_Prev = ADC_Filter_GetFilteredCode(&s_adc2_filter);
+    return current;
 }

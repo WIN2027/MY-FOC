@@ -4,7 +4,7 @@
 #include "arm_math.h"
 #include "cmsis_os2.h"
 #include "DRV8320S.h"
-#include "FOC.h"
+#include "AppFOC.h"
 
 
 
@@ -733,53 +733,26 @@ void Peripheral_Init(void)
   HAL_OPAMP_Start(&hopamp2);
 
 
+  /* 先初始化滤波器，再挂起 ADC DMA，避免首个采样进入未初始化状态 */
+  ADC_Init();
+
   HAL_ADC_Start_DMA(&hadc1,(uint32_t*)&ADC1_DMA_BUF,1);
   HAL_ADC_Start_DMA(&hadc2,(uint32_t*)&ADC2_DMA_BUF,1);
-
-  ADC_Init();
 
   __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT);
   __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_HT);
   __HAL_HRTIM_ENABLE_IT(&hhrtim1, HRTIM_IT_FLT1);
 
-  SerialCom_Init();
-
   MY_DRV8320S_Init();
 
-  FOC_Init();
+  /* FOC 核心必须在 CORDIC/HRTIM 初始化之后、UART 命令任务启动之前完成 */
+  App_FOC_Init();
+  SerialCom_Init();
 
   // 使能 DWT 外设时钟（通常默认已使能）
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-
-  HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
-
-  // 2. 一次性同步启动主定时器 + A + B + D (HAL 宏支持掩码)
-  __HAL_HRTIM_ENABLE(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
-
-  for (volatile uint32_t i = 0; i < 9000; i++){__NOP();}
-
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-
-  HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TB2 | HRTIM_OUTPUT_TD1 | HRTIM_OUTPUT_TD2);
-  // // 2. 一次性同步停止主定时器 + A + B + D (HAL 宏支持掩码)
-  __HAL_HRTIM_DISABLE(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_D);
-
-
-
-  // ReSharper disable once CppDFAEndlessLoop
-  // while (1)
-  // {
-  //   float Test,AB;
-  //   static float theta = 0.0f;
-  //   theta += 2.0f * M_PI * 5.0f * FOC_PWM_DT_HZ;
-  //   if (theta > M_2PI_F) theta -= M_2PI_F;
-  //   float sin_theta, cos_theta;
-  //   arm_sin_cos_f32(theta, &sin_theta, &cos_theta);
-  //   Test = sin_theta;AB = cos_theta;
-  // }
-
-
+  /* 功率级保持关闭，等上位机 0x04/0x09 启动命令后由 FOC_Start() 打开 */
 }
