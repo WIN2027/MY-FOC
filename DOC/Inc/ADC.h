@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "FOC_ADC.h"
+
 /* IIR 系数，与旧工程一致：0.7 -> 48 kHz 下约 10.6 kHz 截止 */
 #ifndef ADC_FILTER_ALPHA
 #define ADC_FILTER_ALPHA      0.7f
@@ -46,6 +48,9 @@ extern float ADC2_Prev;
 
 extern volatile bool ADC1_Ready;
 extern volatile bool ADC2_Ready;
+
+extern ADC_Filter_t s_adc1_filter;
+extern ADC_Filter_t s_adc2_filter;
 
 /** @brief FOC_ADC 模块自检结果；false 时应检查构建/参数 */
 extern volatile bool ADC_SelfTest_OK;

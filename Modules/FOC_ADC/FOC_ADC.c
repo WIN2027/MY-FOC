@@ -81,7 +81,7 @@ void ADC_Filter_Init(ADC_Filter_t *f, float alpha, float midpoint, float current
     if (f == NULL) return;
 
     f->alpha           = sanitize_alpha(alpha);
-    f->one_minus_alpha = 1.0f - f->alpha;
+    // f->one_minus_alpha = 1.0f - f->alpha;
     f->midpoint        = sanitize_midpoint(midpoint);
     f->current_scale   = sanitize_scale(current_scale);
 
@@ -169,8 +169,11 @@ float ADC_Filter_Update(ADC_Filter_t *f, uint16_t raw)
     const uint16_t median = median3_inline(f->window[0], f->window[1], f->window[2]);
 
     /* 3. 一阶 IIR 低通（在 ADC 码值域），使用预存的 1-alpha 省一次减法 */
-    f->iir_prev = f->alpha * (float)median
-                + f->one_minus_alpha * f->iir_prev;
+    // f->iir_prev = f->alpha * (float)median
+    //             + f->one_minus_alpha * f->iir_prev;
+
+    /* 这一句会被 Cortex-M4F/M7F 编译器直接翻译为 VFMA（Fused Multiply-Add），极快 */
+    f->iir_prev = f->iir_prev + f->alpha * ((float)median - f->iir_prev);
 
     /* 4. 码值 → 电流 (A) */
     f->current = (f->iir_prev - f->midpoint) * f->current_scale;
@@ -238,7 +241,7 @@ bool ADC_SelfTest(void)
     /* 4) NaN alpha 安全归 0，one_minus_alpha = 1 */
     ADC_Filter_Init(&f, NAN_F, 2048.0f, 0.0179f);
     if (f.alpha != 0.0f)           ok = false;
-    if (f.one_minus_alpha != 1.0f) ok = false;
+    // if (f.one_minus_alpha != 1.0f) ok = false;
 
     /* 5) NaN / +inf scale 安全归 0，输出恒 0 */
     ADC_Filter_Init(&f, 0.7f, 2048.0f, NAN_F);

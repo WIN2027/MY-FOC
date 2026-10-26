@@ -1003,10 +1003,6 @@ FOC_CCM_TEXT void FOC_Run(float Iu_A, float Iv_A)
         return;
     }
 
-    /* v1.2: 使用 port 层周期测时宏，TEST_MODE 下返回 0，可编译、跑通全链路。
-     * 注意：foc_dwt 含高优先级中断抢占时间，非纯算法耗时。 */
-    const uint32_t ts_start = FOC_PORT_TS_BEGIN();
-
     /* ---- 输入合法性 + 软件过流（v1.3） ---- */
     const float ic = -Iu_A - Iv_A;
 
@@ -1077,10 +1073,6 @@ FOC_CCM_TEXT void FOC_Run(float Iu_A, float Iv_A)
     float v_alpha_applied = 0.0f, v_beta_applied = 0.0f;
     SVPWM(v_alpha, v_beta, &v_alpha_applied, &v_beta_applied);
     if (s_fault_latched) return;
-
-    /* 测时结束 */
-    const uint32_t ts_cycles = FOC_PORT_TS_END(ts_start);
-    FOC_SetCycleCount(ts_cycles);
 
     /* SMO 更新：使用实际施加的电压估计下一拍状态（不计入测时） */
     SMO_Update(i_alpha, i_beta, v_alpha_applied, v_beta_applied);

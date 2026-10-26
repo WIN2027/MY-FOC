@@ -15,16 +15,16 @@
  */
 
 /* ------------------- 对外状态（保持旧工程符号名） ------------------- */
-__attribute__((section(".ccmram_data"))) volatile bool ADC1_Ready = false;
-__attribute__((section(".ccmram_data"))) volatile bool ADC2_Ready = false;
-__attribute__((section(".ccmram_data"))) volatile bool ADC_SelfTest_OK = false;
+ADC_FILTER_DATA volatile bool ADC1_Ready = false;
+ADC_FILTER_DATA volatile bool ADC2_Ready = false;
+ADC_FILTER_DATA volatile bool ADC_SelfTest_OK = false;
 
-__attribute__((section(".ccmram_data"))) float ADC1_Prev = 0.0f;
-__attribute__((section(".ccmram_data"))) float ADC2_Prev = 0.0f;
+ADC_FILTER_DATA float ADC1_Prev = 0.0f;
+ADC_FILTER_DATA float ADC2_Prev = 0.0f;
 
 /* ------------------- FOC_ADC 模块实例 ------------------- */
-static ADC_FILTER_DATA ADC_Filter_t s_adc1_filter;
-static ADC_FILTER_DATA ADC_Filter_t s_adc2_filter;
+ADC_FILTER_DATA ADC_Filter_t s_adc1_filter;
+ADC_FILTER_DATA ADC_Filter_t s_adc2_filter;
 
 void ADC_Init(void)
 {
@@ -45,16 +45,16 @@ void ADC_Init(void)
 #endif
 }
 
-float ADC1_Filter(uint16_t raw)
-{
-    const float current = ADC_Filter_Update(&s_adc1_filter, raw);
-    ADC1_Prev = ADC_Filter_GetFilteredCode(&s_adc1_filter);
-    return current;
-}
-
-float ADC2_Filter(uint16_t raw)
-{
-    const float current = ADC_Filter_Update(&s_adc2_filter, raw);
-    ADC2_Prev = ADC_Filter_GetFilteredCode(&s_adc2_filter);
-    return current;
-}
+// ADC_FILTER_TEXT float ADC1_Filter(uint16_t raw)
+// {
+//     const float current = ADC_Filter_Update(&s_adc1_filter, raw);
+//     ADC1_Prev = ADC_Filter_GetFilteredCode(&s_adc1_filter);
+//     return current;
+// }
+//
+// ADC_FILTER_TEXT float ADC2_Filter(uint16_t raw)
+// {
+//     const float current = ADC_Filter_Update(&s_adc2_filter, raw);
+//     ADC2_Prev = ADC_Filter_GetFilteredCode(&s_adc2_filter);
+//     return current;
+// }

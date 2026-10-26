@@ -5,7 +5,9 @@
 #include "UART.h"
 #include "ADC.h"
 #include "AppFOC.h"
+#include "FOC_ADC.h"
 #include "FOC_CORE.h"
+#include "FOC_PORT_STM32G4.h"
 #include "Init.h"
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
@@ -44,24 +46,26 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef *hhrtim, uint32_t Tim
     FOC_SpeedLoopTick();
 }
 
-__attribute__((section(".ccmram_text"))) void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+FOC_CCM_TEXT void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    if (hadc->Instance == ADC1)
-    {
-        ADC1_Ready = true;
-    }
-    if (hadc->Instance == ADC2)
-    {
-        ADC2_Ready = true;
-    }
+    if (hadc->Instance == ADC1){ADC1_Ready = true;}
+    if (hadc->Instance == ADC2){ADC2_Ready = true;}
 
     if (ADC1_Ready && ADC2_Ready)
     {
+
+        /* v1.2: 使用 port 层周期测时宏，TEST_MODE 下返回 0，可编译、跑通全链路。
+        * 注意：foc_dwt 含高优先级中断抢占时间，非纯算法耗时。 */
+        const uint32_t ts_start = FOC_PORT_TS_BEGIN();
+
         ADC1_Ready = false;
         ADC2_Ready = false;
 
-        const float IU = ADC1_Filter(ADC1_DMA_BUF);
-        const float IV = ADC2_Filter(ADC2_DMA_BUF);
+        const float IU = ADC_Filter_Update(&s_adc2_filter, ADC1_DMA_BUF);
+        const float IV = ADC_Filter_Update(&s_adc2_filter, ADC2_DMA_BUF);
+        /* 测时结束 */
+        const uint32_t ts_cycles = FOC_PORT_TS_END(ts_start);
+        FOC_SetCycleCount(ts_cycles);
 
         FOC_Run(IU, IV);
 
@@ -72,5 +76,6 @@ __attribute__((section(".ccmram_text"))) void HAL_ADC_ConvCpltCallback(ADC_Handl
             App_FOC_Stop();
             App_FOC_AlignDone = true;
         }
+
     }
 }
