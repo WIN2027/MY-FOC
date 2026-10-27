@@ -76,9 +76,9 @@ static uint16_t UART_PackTelemetry(uint8_t *buf, uint16_t cap)
 
     if (mask & 0x0001U) n = append_u16(buf, n, cap, clamp_u16(ADC1_Prev * 16.0f));
     if (mask & 0x0002U) n = append_u16(buf, n, cap, clamp_u16(ADC2_Prev * 16.0f));
-    if (mask & 0x0004U) n = append_i16(buf, n, cap, tele.IU);
-    if (mask & 0x0008U) n = append_i16(buf, n, cap, tele.IV);
-    if (mask & 0x0010U) n = append_i16(buf, n, cap, tele.IW);
+    if (mask & 0x0004U) n = append_i16(buf, n, cap, clamp_i16(tele.IU));
+    if (mask & 0x0008U) n = append_i16(buf, n, cap, clamp_i16(tele.IV));
+    if (mask & 0x0010U) n = append_i16(buf, n, cap, clamp_i16(tele.IW));
     if (mask & 0x0020U) n = append_i16(buf, n, cap, clamp_i16(pi_d.actual * 100.0f));
     if (mask & 0x0040U) n = append_i16(buf, n, cap, clamp_i16(pi_q.actual * 100.0f));
     if (mask & 0x0080U) n = append_i16(buf, n, cap, smo.speed_rpm);

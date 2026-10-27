@@ -53,7 +53,6 @@ FOC_CCM_TEXT void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
     if (ADC1_Ready && ADC2_Ready)
     {
-
         /* v1.2: 使用 port 层周期测时宏，TEST_MODE 下返回 0，可编译、跑通全链路。
         * 注意：foc_dwt 含高优先级中断抢占时间，非纯算法耗时。 */
         const uint32_t ts_start = FOC_PORT_TS_BEGIN();
@@ -63,11 +62,12 @@ FOC_CCM_TEXT void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         const float IU = ADC_Filter_Update(&s_adc2_filter, ADC1_DMA_BUF);
         const float IV = ADC_Filter_Update(&s_adc2_filter, ADC2_DMA_BUF);
+
+        FOC_Run(IU, IV);
+
         /* 测时结束 */
         const uint32_t ts_cycles = FOC_PORT_TS_END(ts_start);
         FOC_SetCycleCount(ts_cycles);
-
-        FOC_Run(IU, IV);
 
         /* 0x09 仅对齐：FOC 核心在 ALIGN 计时结束后会自动切到 OPENLOOP，
          * 这里在同一拍立即停机，避免执行强拖。 */

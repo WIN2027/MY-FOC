@@ -976,16 +976,6 @@ void FOC_OnFault(uint32_t code)
 uint32_t FOC_GetLastFault(void) { return last_fault; }
 
 /* =========================================================
- *  遥测电流 int16 限幅（防 UB）
- * ========================================================= */
-FOC_CCM_TEXT static int16_t clamp_i16(float v)
-{
-    if (v >  32767.0f) return  32767;
-    if (v < -32768.0f) return -32768;
-    return (int16_t)v;
-}
-
-/* =========================================================
  *  主控制函数：每 PWM 周期一次
  * ========================================================= */
 FOC_CCM_TEXT void FOC_Run(float Iu_A, float Iv_A)
@@ -1053,8 +1043,8 @@ FOC_CCM_TEXT void FOC_Run(float Iu_A, float Iv_A)
         openloop_cycle_counter = 0U;
     }
 
-    const float sin_t = sinf(theta);
-    const float cos_t = cosf(theta);
+    float sin_t, cos_t;
+    FOC_PORT_CORDIC_SINCOS(theta, &sin_t, &cos_t);
 
     /* Park */
     float id, iq;
@@ -1089,9 +1079,9 @@ FOC_CCM_TEXT void FOC_Run(float Iu_A, float Iv_A)
     }
 
     /* 遥测三相电流（100 倍放大，int16_t） */
-    s_telemetry.IU = clamp_i16(Iu_A * 100.0f);
-    s_telemetry.IV = clamp_i16(Iv_A * 100.0f);
-    s_telemetry.IW = clamp_i16(ic   * 100.0f);
+    s_telemetry.IU = Iu_A;
+    s_telemetry.IV = Iv_A;
+    s_telemetry.IW = ic;
 }
 
 /* =========================================================

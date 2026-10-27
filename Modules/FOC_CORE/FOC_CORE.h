@@ -46,9 +46,9 @@ typedef struct {
     uint16_t foc_dwt;       /* FOC_Run 入口 -> pwm_write 完成的周期数，饱和 65535
                              * 注意：含高优先级中断抢占时间，非纯算法耗时
                              * TEST_MODE 下恒为 0 */
-    int16_t  IU;
-    int16_t  IV;
-    int16_t  IW;
+    float   IU;
+    float   IV;
+    float   IW;
 } FOC_Telemetry_t;
 
 /* ---------- PWM 输出（遥测用） ---------- */
