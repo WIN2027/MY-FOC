@@ -102,8 +102,8 @@ static uint16_t UART_PackTelemetry(uint8_t *buf, uint16_t cap)
     if (mask & 0x0800U)
     {
         n = append_i16(buf, n, cap, clamp_i16(pi_q.out * 100.0f));
-        n = append_i16(buf, n, cap, clamp_i16(pi_q.error * 100.0f));
         n = append_i16(buf, n, cap, clamp_i16(pi_q.integral * 100.0f));
+        n = append_i16(buf, n, cap, clamp_i16(pi_q.target * 100.0f));
         n = append_i16(buf, n, cap, clamp_i16(pi_q.actual * 100.0f));
     }
 

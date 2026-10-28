@@ -79,6 +79,8 @@ typedef struct {
 typedef struct {
     float kp, ki, kd;
     float target, actual;
+    float target_final;         // 【新增】上位机下发的最终目标
+    float accel_limit;          // 【新增】加速度限制 (RPM/s
     float error, integral, prev_error;
     float out_min, out_max;
     float integral_min, integral_max;
@@ -118,6 +120,7 @@ typedef struct {
     float theta_est_prev;
     float inv_Band;
     float v_est;
+    float theta_comp;           /* 平滑后的补偿角 */
     float conv_rpm_min;         /* v1.3：按强拖目标转速动态计算的收敛阈值 */
     int16_t  speed_rpm;
     uint16_t converged_cnt;

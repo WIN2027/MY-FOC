@@ -51,7 +51,7 @@
 /* =========================================================
  *  速度环分频（每个 PWM 周期调 FOC_SpeedLoopTick）
  * ========================================================= */
-#define FOC_SPEED_LOOP_DIV      25U
+#define FOC_SPEED_LOOP_DIV      15U
 
 /* =========================================================
  *  启动参数范围检查（FOC_SetStartupConfig 内部使用）
@@ -106,7 +106,7 @@
 #define FOC_SMO_CONV_RATIO      0.85f       /* 收敛阈值 = min(RPM_MIN, RATIO × 强拖目标转速)，避免低速配置永远不收敛 */
 #define FOC_SMO_CONV_CNT_MIN    10U         /* 连续满足收敛条件的次数 */
 #define FOC_SMO_CONV_CNT_MAX    1000U       /* 收敛计数器上限（防溢出） */
-#define FOC_SMO_LP_OMEGA_RAD_S  800.0f      /* 反电动势一阶 LPF 截止角速度（rad/s，≈127Hz） */
+#define FOC_SMO_LP_OMEGA_RAD_S  800.0f     /* 反电动势一阶 LPF 截止角速度（rad/s，≈127Hz） */
 
 /* v1.2：Kslide 自动计算（FOC_Init 内按默认目标转速下反电动势峰值推算）
  *   Kslide = FOC_SMO_KSLIDE_MARGIN × ω_e(默认RPM) × ψ_f

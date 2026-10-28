@@ -79,7 +79,7 @@ static void foc_update_kslide(void)
 {
 #if FOC_LEGACY_CONTROL
     /* 原版行为：固定滑模增益，不随目标转速/磁链自动放大 */
-    smo.Kslide = 1.0f;
+    smo.Kslide = 1.5f;
 #else
     float max_rpm = FOC_DEFAULT_TARGET_RPM;
     const float target = fabsf(speed_pid.target);
@@ -255,6 +255,24 @@ FOC_CCM_TEXT static void SMO_Update(float i_alpha, float i_beta,
 {
     const float dt = FOC_PWM_DT_S;
 
+    /* =========================================================
+    * 自适应 LPF 计算 (按转速比例映射)
+    * 建议公式: LPF = (RPM * 0.5) + 300
+    * ========================================================= */
+    const float rpm_abs = fabsf((float)smo.speed_rpm);
+
+    // 基础斜率：每 100 转增加 50 rad/s
+    float target_lpf = (rpm_abs * 0.5f) + 300.0f;
+
+    // 设置一个最低保护，防止极低速时 LPF 过小导致滑模抖振
+    if (target_lpf < 800.0f) {target_lpf = 800.0f;}
+    // 设置一个最高保护，防止极高转速时滤波失效、噪声过大
+    if (target_lpf > 2500.0f) {target_lpf = 2500.0f;}
+
+    // 计算 alpha 值
+    smo.lp_alpha = target_lpf * dt;
+    if (smo.lp_alpha > 1.0f) smo.lp_alpha = 1.0f;
+
     const float err_alpha = smo.i_alpha_est - i_alpha;
     const float err_beta  = smo.i_beta_est  - i_beta;
 
@@ -283,34 +301,52 @@ FOC_CCM_TEXT static void SMO_Update(float i_alpha, float i_beta,
     smo.e_alpha_est = smo.e_alpha_est * (1.0f - smo.lp_alpha) + z_alpha * smo.lp_alpha;
     smo.e_beta_est  = smo.e_beta_est  * (1.0f - smo.lp_alpha) + z_beta  * smo.lp_alpha;
 
-    float e_mag, theta;
-    FOC_PORT_CORDIC_PHASE(smo.e_beta_est, -smo.e_alpha_est, CORDIC_V_SCALE,
-                          &e_mag, &theta);
+    /* ---- 1. 算出原始物理角度 ---- */
+    float e_mag, theta_raw;
+    FOC_PORT_CORDIC_PHASE(smo.e_beta_est, -smo.e_alpha_est, CORDIC_V_SCALE, &e_mag, &theta_raw);
     smo.v_est = e_mag;
 
-    /* 观测器输出纯角度；theta_comp 已停用，不再进入观测或输出。 */
+    /* 规约原始角度到 [0, 2π) */
+    if (theta_raw >= M_2PI_F) theta_raw -= M_2PI_F;
+    if (theta_raw < 0.0f)     theta_raw += M_2PI_F;
+
     if (e_mag > FOC_SMO_E_THRESH)
     {
-        if (theta < 0.0f) theta += M_2PI_F;
-
-        /* ω<0 时 atan2(-e_alpha, e_beta) 偏 π，补偿回来。
-         * 用上一帧的 omega_est 判断符号（速度变化远慢于角度），启动时
-         * omega_est=0 不补偿，自然过渡到正确值。 */
-        if (smo.omega_est < 0.0f)
-        {
-            theta += M_PI_F;
-            if (theta >= M_2PI_F) theta -= M_2PI_F;
+        /* ---- 2. 计算目标补偿角 ---- */
+        float theta_comp_target = 0.0f;
+        if (fabsf(smo.omega_est) > 5.0f) {
+            float comp_mag;
+            FOC_PORT_CORDIC_PHASE(FOC_SMO_LP_OMEGA_RAD_S, fabsf(smo.omega_est), CORDIC_FREQ_SCALE, &comp_mag, &theta_comp_target);
+            if (smo.omega_est < 0.0f) {
+                theta_comp_target = -theta_comp_target;
+            }
         }
 
-        while (theta >= M_2PI_F) theta -= M_2PI_F;
-        while (theta < 0.0f)     theta += M_2PI_F;
-        smo.theta_est = theta;
+        /* ---- 3. 极度平滑补偿角 ---- */
+        smo.theta_comp = smo.theta_comp * 0.95f + theta_comp_target * 0.05f;
+
+        /* ---- 4. 生成给电流环用的“超前输出角度” ---- */
+        float theta_out = theta_raw + smo.theta_comp;
+        if (theta_out >= M_2PI_F) theta_out -= M_2PI_F;
+        if (theta_out < 0.0f)     theta_out += M_2PI_F;
+
+        smo.theta_est = theta_out;
+    }
+    else
+    {
+        /* 反电动势太小（比如刚启动），放弃补偿，直接用原始角 */
+        smo.theta_est = theta_raw;
+        smo.theta_comp = 0.0f;
     }
 
-    float d_theta = smo.theta_est - smo.theta_est_prev;
+    /* ---- 5. 关键：求导算转速，必须使用纯物理原始角！ ---- */
+    float d_theta = theta_raw - smo.theta_est_prev;
     if (d_theta >  M_PI_F) d_theta -= M_2PI_F;
     if (d_theta < -M_PI_F) d_theta += M_2PI_F;
     const float omega_raw = d_theta / dt;
+
+    /* 记录本次的原始角，供下一拍求导 */
+    smo.theta_est_prev = theta_raw;
 
     const float OMEGA_LP = 100.0f;
     float a_omega = OMEGA_LP * dt;
@@ -319,7 +355,6 @@ FOC_CCM_TEXT static void SMO_Update(float i_alpha, float i_beta,
 
     const float rpm = smo.omega_est * (FOC_RAD_S_TO_RPM / (float)foc_pole_pairs());
 
-    /* v1.2: int16 饱和，消除浮点→整型转换超范围的 UB */
     if (rpm > 32767.0f)        smo.speed_rpm =  32767;
     else if (rpm < -32768.0f)  smo.speed_rpm = -32768;
     else                       smo.speed_rpm = (int16_t)rpm;
@@ -334,8 +369,6 @@ FOC_CCM_TEXT static void SMO_Update(float i_alpha, float i_beta,
         smo.converged_cnt = 0;
         smo.converged = false;
     }
-
-    smo.theta_est_prev = smo.theta_est;
 }
 
 /* =========================================================
@@ -507,8 +540,25 @@ FOC_CCM_TEXT static float FOC_GetAngle(void)
  * ========================================================= */
 FOC_CCM_TEXT static void SpeedLoop_Update(void)
 {
-    speed_pid.actual = (float)smo.speed_rpm;
+    // speed_pid.actual = (float)smo.speed_rpm;
     const float dt = speed_pid.sample_time;
+
+    float raw_rpm = smo.speed_rpm;
+    // alpha = 0.1 ~ 0.3。0.1 更平滑但响应慢，0.2 适中。
+    // 注意这里使用一阶低通滤波公式
+    const float alpha = 0.8f;
+    speed_pid.actual = speed_pid.actual * (1.0f - alpha) + raw_rpm * alpha;
+
+    /* =========================================================
+     * 目标转速斜坡发生器 (Slew Rate Limiter)
+     * 让 target 以设定的加速度，平滑地逼近 target_final
+     * ========================================================= */
+    const float max_step = speed_pid.accel_limit * dt; // 每个速度环周期允许的最大变化量
+    float diff = speed_pid.target_final - speed_pid.target;
+
+    if (diff > max_step) {speed_pid.target += max_step;}
+    else if (diff < -max_step) {speed_pid.target -= max_step;}
+    else {speed_pid.target = speed_pid.target_final;} // 足够近了，直接对齐
 
     const float error = speed_pid.target - speed_pid.actual;
     speed_pid.error = error;
@@ -617,20 +667,23 @@ void FOC_Init(void)
     if (was_initialized) FOC_PORT_PWM_DISABLE();
 
     /* ---- 速度环 PID ---- */
-    speed_pid.kp = 0.001f;
+    speed_pid.kp = 0.0015f;
     speed_pid.ki = 0.2f;
     speed_pid.kd = 0.0001f;
     speed_pid.target = FOC_DEFAULT_TARGET_RPM;
+    speed_pid.target_final = FOC_DEFAULT_TARGET_RPM; // 新增
+    speed_pid.accel_limit = 3000.0f;                 // 【新增】加速度限制，3000 RPM/s 意味着 1秒钟加速 3000转
+
     speed_pid.actual = 0.0f;
     speed_pid.error = 0.0f;
     speed_pid.integral = 0.0f;
     speed_pid.prev_error = 0.0f;
     speed_pid.derivative_filtered = 0.0f;
     speed_pid.filter_alpha = 0.1f;
-    speed_pid.out_min = -2.5f;
-    speed_pid.out_max =  2.5f;
-    speed_pid.integral_min = -4.0f;
-    speed_pid.integral_max =  4.0f;
+    speed_pid.out_min = -4.5f;
+    speed_pid.out_max =  4.5f;
+    speed_pid.integral_min = -8.0f;
+    speed_pid.integral_max =  8.0f;
     speed_pid.sample_time = (float)FOC_SPEED_LOOP_DIV / (float)FOC_PWM_FREQ_HZ;
     speed_pid.speed_loop_cnt = 0U;
 
@@ -642,10 +695,10 @@ void FOC_Init(void)
     pi_d.error = 0.0f;
     pi_d.integral = 0.0f;
     pi_d.out = 0.0f;
-    pi_d.out_min = -2.0f;
-    pi_d.out_max =  2.0f;
-    pi_d.integral_min = -4.0f;
-    pi_d.integral_max =  4.0f;
+    pi_d.out_min = -4.0f;
+    pi_d.out_max =  4.0f;
+    pi_d.integral_min = -8.0f;
+    pi_d.integral_max =  8.0f;
     pi_d.dead_zone = 0.02f;
     pi_d.sample_time = FOC_PWM_DT_S;
 
@@ -681,6 +734,7 @@ void FOC_Init(void)
     smo.i_alpha_est = smo.i_beta_est = 0.0f;
     smo.e_alpha_est = smo.e_beta_est = 0.0f;
     smo.theta_est = smo.omega_est = smo.theta_est_prev = 0.0f;
+    smo.theta_comp = 0.0f;
     smo.v_est = 0.0f;
     smo.converged_cnt = 0;
     smo.converged = false;
@@ -1124,7 +1178,8 @@ FOC_CCM_TEXT void FOC_SpeedLoopTick(void)
  * ========================================================= */
 void FOC_SetSpeedTarget(int16_t rpm)
 {
-    speed_pid.target = (float)rpm;
+    //speed_pid.target = (float)rpm;
+    speed_pid.target_final = (float)rpm; // 改为存入最终目标
     foc_update_kslide();   /* 目标转速提高时同步提高 Kslide */
 }
 
